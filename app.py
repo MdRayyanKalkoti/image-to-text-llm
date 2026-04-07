@@ -28,7 +28,7 @@ import json
 import cv2
 import logging
 import unicodedata
-import easyocr
+import pytesseract
 from flask import Flask, render_template, request
 
 # ─────────────────────────────────────────────────────────────
