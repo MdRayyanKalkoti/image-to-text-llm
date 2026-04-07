@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🧠 Image-to-Text LLM
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
@@ -335,3 +336,7 @@ This project is licensed under the [MIT License](LICENSE).
 <p align="center">
   Built with precision by <a href="https://github.com/MdRayyanKalkoti">Md Rayyan</a> · Engineered for production, not portfolios.
 </p>
+=======
+# image-to-text-llm
+Production-ready Image-to-Text LLM app that extracts, processes, and analyzes text from images using AI. Built with Flask, optimized for real-world deployment on Render with secure environment handling.
+>>>>>>> 46de7a780f47a50f03a622796717055be4a5a7de
