@@ -281,7 +281,6 @@ This project is configured for zero-friction deployment on [Render](https://rend
 6. Click **Deploy** — Render manages HTTPS, uptime, and scaling automatically
 
 > 💡 For frontend delivery at the edge, pair with **Cloudflare Pages** for zero cold-start latency and a globally distributed CDN.
-
 ---
 
 ## 🌐 Live Demo
