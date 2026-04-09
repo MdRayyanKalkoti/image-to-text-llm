@@ -82,6 +82,7 @@ required = {
     ".env.example":         "Env template",
     ".gitignore":           "Git ignore",
     "templates/index.html": "Main UI",
+    "postinstall.py":        "easyocr bidi patch for Render",
 }
 optional = {"README.md": "Documentation", "LICENSE": "License"}
 for fpath, desc in required.items():
@@ -92,6 +93,20 @@ for fpath, desc in required.items():
             record_render("render.yaml missing — Render cannot deploy")
 for fpath, desc in optional.items():
     ok(fpath) if os.path.exists(fpath) else record_warn(f"Missing optional: {fpath}")
+
+header("3c · postinstall.py Patch Validation")
+if os.path.exists("postinstall.py"):
+    ps = open("postinstall.py").read()
+    if "from bidi import get_display" in ps and "from bidi.algorithm import get_display" in ps:
+        ok("postinstall.py patches easyocr bidi import correctly")
+    elif "bidi.algorithm" in ps:
+        ok("postinstall.py contains bidi.algorithm patch")
+    else:
+        record_render("postinstall.py exists but does not patch bidi import",
+            "Ensure it replaces 'from bidi import get_display' with 'from bidi.algorithm import get_display'")
+else:
+    record_render("postinstall.py missing — easyocr will crash on Render at startup",
+        "Create postinstall.py with bidi patch and add '&& python postinstall.py' to buildCommand")
 
 header("3b · docs/ Screenshots")
 for f in ["docs/hero-ui.png","docs/upload_ui.png","docs/processing_ui.png",
@@ -298,8 +313,15 @@ if os.path.exists("render.yaml"):
     else: record_render("PYTHON_VERSION not pinned", "Add: - key: PYTHON_VERSION / value: 3.11.0")
     rok("DEEPSEEK_API_KEY declared") if "DEEPSEEK_API_KEY" in ry else \
     record_render("DEEPSEEK_API_KEY missing", "Add: - key: DEEPSEEK_API_KEY / sync: false")
-    rok("buildCommand correct") if "pip install" in ry and "requirements.txt" in ry else \
-    record_render("buildCommand wrong", "pip install -r requirements.txt")
+    if "pip install" in ry and "requirements.txt" in ry:
+        rok("buildCommand: pip install -r requirements.txt")
+        if "postinstall.py" in ry:
+            rok("buildCommand runs postinstall.py patch")
+        else:
+            record_render("postinstall.py not in buildCommand — easyocr bidi will crash on Render",
+                "Change to: pip install -r requirements.txt && python postinstall.py")
+    else:
+        record_render("buildCommand wrong", "pip install -r requirements.txt && python postinstall.py")
 else:
     record_render("render.yaml missing")
 
