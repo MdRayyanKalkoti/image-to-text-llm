@@ -11,7 +11,7 @@ import logging
 import unicodedata
 import easyocr
 
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, jsonify   # jsonify moved to top
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("visionocr")
@@ -29,9 +29,33 @@ app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-log.info("Loading EasyOCR model...")
-reader = easyocr.Reader(["en"], gpu=False)
-log.info("EasyOCR ready.")
+# ── lazy EasyOCR (loads on first request, not at startup — saves memory on boot)
+reader = None
+
+def get_reader():
+    global reader
+    if reader is None:
+        log.info("Loading EasyOCR model...")
+        reader = easyocr.Reader(["en"], gpu=False)
+        log.info("EasyOCR ready.")
+    return reader
+
+
+# ── cache OpenAI/DeepSeek exception classes at module load
+#    (avoids __import__ call on every exception, which was the original approach)
+try:
+    from openai import (
+        RateLimitError     as _RateLimitError,
+        AuthenticationError as _AuthError,
+        APITimeoutError    as _TimeoutError,
+        APIConnectionError  as _ConnError,
+        BadRequestError    as _BadRequestError,
+    )
+    _OPENAI_EXCEPTIONS = (_RateLimitError, _AuthError, _TimeoutError,
+                          _ConnError, _BadRequestError, Exception)
+except ImportError:
+    _RateLimitError = _AuthError = _TimeoutError = _ConnError = _BadRequestError = Exception
+    _OPENAI_EXCEPTIONS = (Exception,)
 
 
 # ===============================================================
@@ -60,7 +84,7 @@ def enhance_image(path: str):
 # ===============================================================
 
 def run_ocr(processed_img, confidence_threshold: float = 0.25) -> list:
-    results = reader.readtext(processed_img, detail=1, paragraph=False)
+    results = get_reader().readtext(processed_img, detail=1, paragraph=False)
     results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
     lines, line_buffer = [], []
     current_y = None
@@ -147,7 +171,6 @@ def _char_swaps(text: str) -> str:
     text = re.sub(r"\*(\d)", r"$\1", text)
     text = re.sub(r"\bI\s+([Oo]tal)\b", r"T\1", text)
     text = re.sub(r"\bI\s+([Nn]voice)\b", r"I\1", text)
-    # Fix phone: 1 23-456-7890 or 123 456-7890 -> 123-456-7890
     text = re.sub(r'(?<!\d)1\s+(\d{2}-\d{3}-\d{4})', r'1-\1', text)
     text = _fix_price_format(text)
     text = "".join(ch for ch in text
@@ -207,12 +230,25 @@ _META_LABELS = re.compile(
     re.IGNORECASE
 )
 
+# ── compiled at module level (not per-request) — avoids re-compiling on every call
+_PRICE_PAT = re.compile(r'[\$\u20b9\u20ac\u00a3]?\s*\d{1,5}[.,]\d{2}\b')
+_FIN_PRICE  = re.compile(r'[\$\u20b9\u20ac\u00a3]?\s*\d{1,6}[.,]\d{2}')
+
 
 def _normalise_price(raw: str) -> str:
     """Normalise price: remove spaces, fix comma-decimal 6,50->6.50"""
     p = raw.strip().replace(" ", "")
     p = re.sub(r'(\d+),(\d{2})$', r'\1.\2', p)
     return p
+
+
+def _money(label: str, clean_text: str):
+    """Find the last price on a line matching label."""
+    m = re.search(rf'(?i)^.*{label}.*$', clean_text, re.MULTILINE)
+    if not m:
+        return None
+    prices = _FIN_PRICE.findall(m.group(0))
+    return _normalise_price(prices[-1]) if prices else None
 
 
 def rule_extract(clean_text: str) -> dict:
@@ -231,26 +267,32 @@ def rule_extract(clean_text: str) -> dict:
     else:
         doc_type = "Receipt"
 
-    # -- Vendor = first non-empty line
-    vendor = next((l.strip() for l in lines if l.strip()), None)
+    # -- Vendor: first non-empty line that is NOT a financial or meta line
+    #    (prevents Total/Tax from being captured as vendor)
+    vendor = None
+    for l in lines:
+        stripped = l.strip()
+        if (stripped
+                and not _FINANCIAL_LABELS.match(stripped)
+                and not _META_LABELS.match(stripped)
+                and not re.match(r'^[\$\u20b9]?\d', stripped)):
+            vendor = stripped
+            break
 
-    # -- Address: scan for label
+    # -- Address
     address = None
     for l in lines:
         if re.search(r"(?i)(address|adress|addr)[:\s]", l):
             address = re.sub(r"(?i)(address|adress|addr)[:\s]*", "", l).strip()
-            # clean trailing bracket artifacts
             address = re.sub(r'[\[\]{}]', '', address).strip()
             break
 
-    # -- Phone: scan for label first, then fallback to digit pattern
+    # -- Phone
     phone = None
     for l in lines:
         if re.search(r"(?i)\b(tel|phone|ph|mobile)\b[:\s]", l):
             raw_phone = re.sub(r"(?i)\b(tel|phone|ph|mobile)\b[:\s]*", "", l).strip()
-            # Remove bracket artifacts from OCR
             raw_phone = re.sub(r'[\[\]{}]', '', raw_phone).strip()
-            # Fix OCR split: "23-456-7890" should be "123-456-7890"
             if raw_phone and not raw_phone.startswith('1') and len(raw_phone) < 11:
                 raw_phone = '1' + raw_phone if re.match(r'\d', raw_phone) else raw_phone
             phone = raw_phone
@@ -267,17 +309,11 @@ def rule_extract(clean_text: str) -> dict:
     time_val = _first(r"(\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[aApP][mM])?\b)", clean_text)
 
     # -- Line items
-    # Price pattern: matches 6.50, 84.80, $6.50, 6,50
-    _PRICE_PAT = re.compile(
-        r'[\$\u20b9\u20ac\u00a3]?\s*\d{1,5}[.,]\d{2}\b'
-    )
-
     items = []
     for l in lines:
         stripped = l.strip()
         if not stripped:
             continue
-        # Skip financial totals and meta/header lines
         if _FINANCIAL_LABELS.match(stripped):
             continue
         if _META_LABELS.match(stripped):
@@ -287,36 +323,20 @@ def rule_extract(clean_text: str) -> dict:
         if not prices:
             continue
 
-        raw_price = prices[-1].strip()
-        price = _normalise_price(raw_price)
-
-        # Extract item name — remove price and leading qty
-        name = _PRICE_PAT.sub('', stripped).strip()
-        name = re.sub(r'^\d+\s*[xX*]?\s*', '', name).strip().rstrip(' :-,')
+        price = _normalise_price(prices[-1].strip())
+        name  = _PRICE_PAT.sub('', stripped).strip()
+        name  = re.sub(r'^\d+\s*[xX*]?\s*', '', name).strip().rstrip(' :-,')
 
         if len(name) < 2:
             continue
 
         items.append({"qty": "1", "name": name, "price": price})
 
-    # -- Financials — handles $84.80, 84.80, 84,80
-    _FIN_PRICE = re.compile(
-        r'[\$\u20b9\u20ac\u00a3]?\s*\d{1,6}[.,]\d{2}'
-    )
-
-    def _money(label: str):
-        m = re.search(rf'(?i)^.*{label}.*$', clean_text, re.MULTILINE)
-        if not m:
-            return None
-        prices = _FIN_PRICE.findall(m.group(0))
-        if not prices:
-            return None
-        return _normalise_price(prices[-1])
-
-    subtotal = _money(r"sub.?total")
-    tax      = _money(r"sales.?tax|(?<!\w)tax(?!\w)")
-    total    = _money(r"(?<!\w)total(?!\s*due)(?!.*sub)")
-    balance  = _money(r"balance")
+    # -- Financials
+    subtotal = _money(r"sub.?total", clean_text)
+    tax      = _money(r"sales.?tax|(?<!\w)tax(?!\w)", clean_text)
+    total    = _money(r"(?<!\w)total(?!\s*due)(?!.*sub)", clean_text)
+    balance  = _money(r"balance", clean_text)
 
     thank_you = "THANK YOU" if "thank you" in lower else None
 
@@ -325,15 +345,14 @@ def rule_extract(clean_text: str) -> dict:
                  ("Tel", phone), ("Date", date), ("Time", time_val)]:
         if v:
             fields[k] = v.strip()
+    if thank_you:
+        fields["Note"] = thank_you
 
     financials = {}
     for k, v in [("Sub-total", subtotal), ("Sales Tax", tax),
                  ("Total", total), ("Balance", balance)]:
         if v:
             financials[k] = v.strip()
-
-    if thank_you:
-        fields["Note"] = thank_you
 
     result = {
         "doc_type":   doc_type,
@@ -391,10 +410,6 @@ Return only the JSON object.
 """
 
 
-def _openai_exc(name: str):
-    return getattr(__import__("openai", fromlist=[name]), name)
-
-
 def llm_understand(clean_text: str):
     if not clean_text.strip():
         return None, "Empty input."
@@ -411,15 +426,15 @@ def llm_understand(clean_text: str):
             max_tokens=1200,
             response_format={"type": "json_object"},
         )
-    except _openai_exc("RateLimitError"):
+    except _RateLimitError:
         return None, "DeepSeek rate limit — using rule-based extraction."
-    except _openai_exc("AuthenticationError"):
+    except _AuthError:
         return None, "Invalid DeepSeek API key."
-    except _openai_exc("APITimeoutError"):
+    except _TimeoutError:
         return None, "DeepSeek request timed out."
-    except _openai_exc("APIConnectionError"):
+    except _ConnError:
         return None, "Cannot reach DeepSeek."
-    except _openai_exc("BadRequestError") as exc:
+    except _BadRequestError as exc:
         return None, f"DeepSeek rejected request: {exc}"
     except Exception as exc:
         return None, f"Unexpected error ({type(exc).__name__})."
@@ -460,6 +475,7 @@ def index():
         try:
             processed = enhance_image(path)
         except Exception as exc:
+            _cleanup(path)
             return render_template("index.html", raw_text="", clean_text="",
                 intelligence=None, ai_source="none", ai_error=None,
                 error=f"Image error: {exc}")
@@ -467,6 +483,9 @@ def index():
         raw_lines  = run_ocr(processed, confidence_threshold=0.25)
         raw_text   = "\n".join(raw_lines)
         clean_text = pre_clean(raw_lines)
+
+        # Clean up uploaded file after processing — prevents disk fill on Render
+        _cleanup(path)
 
         use_llm = request.form.get("refine") == "true"
         if use_llm:
@@ -486,9 +505,17 @@ def index():
         intelligence=intelligence, ai_source=ai_source, ai_error=ai_error, error=None)
 
 
+def _cleanup(path: str) -> None:
+    """Silently remove uploaded file after processing."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
 @app.route("/health")
 def health():
-    from flask import jsonify
     return jsonify({"status": "ok", "version": "3.3.0", "llm": "deepseek-chat"})
 
 
