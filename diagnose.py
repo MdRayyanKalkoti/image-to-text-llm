@@ -97,16 +97,26 @@ for fpath, desc in optional.items():
 header("3c · postinstall.py Patch Validation")
 if os.path.exists("postinstall.py"):
     ps = open("postinstall.py").read()
-    if "from bidi import get_display" in ps and "from bidi.algorithm import get_display" in ps:
-        ok("postinstall.py patches easyocr bidi import correctly")
-    elif "bidi.algorithm" in ps:
-        ok("postinstall.py contains bidi.algorithm patch")
-    else:
-        record_render("postinstall.py exists but does not patch bidi import",
-            "Ensure it replaces 'from bidi import get_display' with 'from bidi.algorithm import get_display'")
+    checks = [
+        ("os.walk",             "Scans all site-packages paths (not just global)"),
+        ("bidi.algorithm",      "Patches bidi import to bidi.algorithm"),
+        ("sys.path",            "Searches sys.path for .venv paths"),
+        ("find_and_patch",      "find_and_patch function defined"),
+        ("sys.exit(1)",         "Exits with error if patch fails"),
+    ]
+    all_ok = True
+    for needle, desc in checks:
+        if needle in ps:
+            ok(f"postinstall.py: {desc}")
+        else:
+            record_render(f"postinstall.py missing: {desc}",
+                "Replace postinstall.py with the latest version")
+            all_ok = False
+    if all_ok:
+        ok("postinstall.py is robust — will patch Render .venv correctly")
 else:
-    record_render("postinstall.py missing — easyocr will crash on Render at startup",
-        "Create postinstall.py with bidi patch and add '&& python postinstall.py' to buildCommand")
+    record_render("postinstall.py missing — easyocr WILL crash on Render",
+        "Create postinstall.py and add '&& python postinstall.py' to buildCommand in render.yaml")
 
 header("3b · docs/ Screenshots")
 for f in ["docs/hero-ui.png","docs/upload_ui.png","docs/processing_ui.png",
