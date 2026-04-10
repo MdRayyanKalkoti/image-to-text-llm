@@ -1,6 +1,7 @@
 ﻿"""
-VisionOCR — Document Intelligence Pipeline  v3.3
+VisionOCR — Document Intelligence Pipeline  v3.4
 Author : Md Rayyan
+OCR: Tesseract (lightweight, ~50MB vs EasyOCR's 450MB — fits Render free tier)
 """
 
 import os
@@ -9,9 +10,10 @@ import json
 import cv2
 import logging
 import unicodedata
-import easyocr
+import pytesseract
+import numpy as np
 
-from flask import Flask, render_template, request, jsonify   # jsonify moved to top
+from flask import Flask, render_template, request, jsonify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("visionocr")
@@ -29,38 +31,19 @@ app = Flask(__name__)
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# ── lazy EasyOCR (loads on first request, not at startup — saves memory on boot)
-reader = None
-
-def get_reader():
-    global reader
-    if reader is None:
-        log.info("Loading EasyOCR model...")
-        reader = easyocr.Reader(
-            ["en"],
-            gpu=False,
-            verbose=False,
-            quantize=True          # cuts model memory by ~40%
-        )
-        log.info("EasyOCR ready.")
-    return reader
-
-
-# ── cache OpenAI/DeepSeek exception classes at module load
-#    (avoids __import__ call on every exception, which was the original approach)
+# Cache OpenAI exception classes at module load
 try:
     from openai import (
-        RateLimitError     as _RateLimitError,
+        RateLimitError      as _RateLimitError,
         AuthenticationError as _AuthError,
-        APITimeoutError    as _TimeoutError,
+        APITimeoutError     as _TimeoutError,
         APIConnectionError  as _ConnError,
-        BadRequestError    as _BadRequestError,
+        BadRequestError     as _BadRequestError,
     )
-    _OPENAI_EXCEPTIONS = (_RateLimitError, _AuthError, _TimeoutError,
-                          _ConnError, _BadRequestError, Exception)
 except ImportError:
     _RateLimitError = _AuthError = _TimeoutError = _ConnError = _BadRequestError = Exception
-    _OPENAI_EXCEPTIONS = (Exception,)
+
+log.info("VisionOCR v3.4 ready — using Tesseract OCR engine.")
 
 
 # ===============================================================
@@ -85,27 +68,23 @@ def enhance_image(path: str):
 
 
 # ===============================================================
-# STAGE 2 - OCR + LINE RECONSTRUCTION
+# STAGE 2 - OCR (Tesseract — lightweight, no torch required)
 # ===============================================================
 
-def run_ocr(processed_img, confidence_threshold: float = 0.25) -> list:
-    results = get_reader().readtext(processed_img, detail=1, paragraph=False)
-    results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
-    lines, line_buffer = [], []
-    current_y = None
-    for bbox, text, conf in results:
-        if conf < confidence_threshold:
-            continue
-        y = bbox[0][1]
-        if current_y is None:
-            current_y = y
-        if abs(y - current_y) > 20:
-            if line_buffer:
-                lines.append(" ".join(line_buffer))
-            line_buffer, current_y = [], y
-        line_buffer.append(text.strip())
-    if line_buffer:
-        lines.append(" ".join(line_buffer))
+# Tesseract config: OEM 3 (LSTM), PSM 6 (assume uniform block of text)
+_TESS_CONFIG = r"--oem 3 --psm 6"
+
+
+def run_ocr(processed_img) -> list:
+    """
+    Run Tesseract OCR on the enhanced image.
+    Returns list of non-empty lines.
+    """
+    from PIL import Image
+    pil_img = Image.fromarray(processed_img)
+    raw = pytesseract.image_to_string(pil_img, config=_TESS_CONFIG)
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    log.info("[Raw OCR] %d lines extracted", len(lines))
     return lines
 
 
@@ -124,27 +103,22 @@ _BOX_DRAW_RE  = re.compile(r"[\u2500-\u257F\u2580-\u259F\u25A0-\u25FF]+")
 _REPEAT_PUNC  = re.compile(r"([^\w\s])\1{2,}")
 
 _WORD_CORRECTIONS = {
-    "oice":        "Invoice",
-    "nvoice":      "Invoice",
-    "nvice":       "Invoice",
-    "eceipt":      "Receipt",
-    "eceiot":      "Receipt",
-    "ubtotal":     "Subtotal",
-    "alance":      "Balance",
-    "mount":       "Amount",
-    "hank":        "Thank",
-    "innvoice":    "Invoice",
+    "oice":        "Invoice",    "nvoice":      "Invoice",
+    "nvice":       "Invoice",    "eceipt":      "Receipt",
+    "eceiot":      "Receipt",    "ubtotal":     "Subtotal",
+    "alance":      "Balance",    "mount":       "Amount",
+    "hank":        "Thank",      "innvoice":    "Invoice",
     "tootal":      "Total",
-    "supercarket": "Supermarket", "superrnaret": "Supermarket",
-    "invoce":      "Invoice",     "lnvoice":     "Invoice",
-    "arnount":     "Amount",      "payrnent":    "Payment",
-    "custorner":   "Customer",    "nurnber":     "Number",
-    "reciept":     "Receipt",     "subtotai":    "Subtotal",
-    "totai":       "Total",       "discaunt":    "Discount",
-    "quantty":     "Quantity",    "quanity":     "Quantity",
-    "pnone":       "Phone",       "ernail":      "Email",
-    "clate":       "Date",        "tirne":       "Time",
-    "kq":          "kg",          "rnl":         "ml",
+    "supercarket": "Supermarket","superrnaret": "Supermarket",
+    "invoce":      "Invoice",    "lnvoice":     "Invoice",
+    "arnount":     "Amount",     "payrnent":    "Payment",
+    "custorner":   "Customer",   "nurnber":     "Number",
+    "reciept":     "Receipt",    "subtotai":    "Subtotal",
+    "totai":       "Total",      "discaunt":    "Discount",
+    "quantty":     "Quantity",   "quanity":     "Quantity",
+    "pnone":       "Phone",      "ernail":      "Email",
+    "clate":       "Date",       "tirne":       "Time",
+    "kq":          "kg",         "rnl":         "ml",
 }
 _SPELL_RE = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in _WORD_CORRECTIONS) + r")\b",
@@ -159,13 +133,12 @@ def _is_garbage(token: str) -> bool:
 
 
 def _fix_price_format(text: str) -> str:
-    """Fix OCR comma-as-decimal: 6,50 -> 6.50  |  76,80 -> 76.80"""
     return re.sub(r'(\d+),(\d{2})\b', r'\1.\2', text)
 
 
 def _char_swaps(text: str) -> str:
     text = re.sub(r"\b([Oo])(\d)/([Oo\d]{1,2})/(\d{4})\b",
-                  lambda m: m.group(0).replace("O", "0").replace("o", "0"), text)
+                  lambda m: m.group(0).replace("O","0").replace("o","0"), text)
     text = re.sub(r"\bN0\b", "No", text)
     text = re.sub(r"\b[Tt]0[Tt][Aa][Ll]\b", "Total", text)
     text = re.sub(r"(\b[\w.+-]+@[\w-]+)\s+\.?\s*(com|in|org|net|co)\b",
@@ -179,16 +152,14 @@ def _char_swaps(text: str) -> str:
     text = re.sub(r'(?<!\d)1\s+(\d{2}-\d{3}-\d{4})', r'1-\1', text)
     text = _fix_price_format(text)
     text = "".join(ch for ch in text
-                   if unicodedata.category(ch) not in ("Cc", "Cf") or ch in "\n\t")
+                   if unicodedata.category(ch) not in ("Cc","Cf") or ch in "\n\t")
     return text
 
 
 def _spell_fix(m: re.Match) -> str:
     w = m.group(0)
     c = _WORD_CORRECTIONS.get(w.lower()) or _WORD_CORRECTIONS.get(w)
-    if not c:
-        return w
-    return c.upper() if w.isupper() else c
+    return (c.upper() if w.isupper() else c) if c else w
 
 
 def pre_clean(raw_lines: list) -> str:
@@ -221,34 +192,24 @@ def _first(pattern: str, text: str, flags: int = re.IGNORECASE):
     return val.strip() if val is not None else None
 
 
-# Financial labels — lines with these are NEVER line items
 _FINANCIAL_LABELS = re.compile(
     r'(?i)^\s*(total|sub.?total|sales.?tax|tax|balance|gratuity|tip|'
-    r'amount\s+due|total\s+due|grand\s+total)',
-    re.IGNORECASE
-)
+    r'amount\s+due|total\s+due|grand\s+total)', re.IGNORECASE)
 
-# Header/meta labels — lines with these are NEVER line items
 _META_LABELS = re.compile(
     r'(?i)^\s*(cash\s+receipt|receipt|invoice|thank\s+you|address|adress|'
-    r'addr|tel|phone|ph|mobile|date|time|server|table|guests?)',
-    re.IGNORECASE
-)
+    r'addr|tel|phone|ph|mobile|date|time|server|table|guests?)', re.IGNORECASE)
 
-# ── compiled at module level (not per-request) — avoids re-compiling on every call
 _PRICE_PAT = re.compile(r'[\$\u20b9\u20ac\u00a3]?\s*\d{1,5}[.,]\d{2}\b')
 _FIN_PRICE  = re.compile(r'[\$\u20b9\u20ac\u00a3]?\s*\d{1,6}[.,]\d{2}')
 
 
 def _normalise_price(raw: str) -> str:
-    """Normalise price: remove spaces, fix comma-decimal 6,50->6.50"""
     p = raw.strip().replace(" ", "")
-    p = re.sub(r'(\d+),(\d{2})$', r'\1.\2', p)
-    return p
+    return re.sub(r'(\d+),(\d{2})$', r'\1.\2', p)
 
 
 def _money(label: str, clean_text: str):
-    """Find the last price on a line matching label."""
     m = re.search(rf'(?i)^.*{label}.*$', clean_text, re.MULTILINE)
     if not m:
         return None
@@ -260,20 +221,17 @@ def rule_extract(clean_text: str) -> dict:
     lines = clean_text.strip().splitlines()
     lower = clean_text.lower()
 
-    # -- Document type
-    if any(w in lower for w in ("subtotal", "sub-total", "gratuity", "server", "guests")):
+    if any(w in lower for w in ("subtotal","sub-total","gratuity","server","guests")):
         doc_type = "Receipt"
-    elif any(w in lower for w in ("invoice", "bill to", "due date")):
+    elif any(w in lower for w in ("invoice","bill to","due date")):
         doc_type = "Invoice"
-    elif any(w in lower for w in ("prescription", "rx", "pharmacy")):
+    elif any(w in lower for w in ("prescription","rx","pharmacy")):
         doc_type = "Prescription"
-    elif any(w in lower for w in ("linkedin", "ceo", "manager", "engineer")):
+    elif any(w in lower for w in ("linkedin","ceo","manager","engineer")):
         doc_type = "Business Card"
     else:
         doc_type = "Receipt"
 
-    # -- Vendor: first non-empty line that is NOT a financial or meta line
-    #    (prevents Total/Tax from being captured as vendor)
     vendor = None
     for l in lines:
         stripped = l.strip()
@@ -284,22 +242,20 @@ def rule_extract(clean_text: str) -> dict:
             vendor = stripped
             break
 
-    # -- Address
     address = None
     for l in lines:
         if re.search(r"(?i)(address|adress|addr)[:\s]", l):
-            address = re.sub(r"(?i)(address|adress|addr)[:\s]*", "", l).strip()
-            address = re.sub(r'[\[\]{}]', '', address).strip()
+            address = re.sub(r"(?i)(address|adress|addr)[:\s]*","",l).strip()
+            address = re.sub(r'[\[\]{}]','',address).strip()
             break
 
-    # -- Phone
     phone = None
     for l in lines:
         if re.search(r"(?i)\b(tel|phone|ph|mobile)\b[:\s]", l):
-            raw_phone = re.sub(r"(?i)\b(tel|phone|ph|mobile)\b[:\s]*", "", l).strip()
-            raw_phone = re.sub(r'[\[\]{}]', '', raw_phone).strip()
+            raw_phone = re.sub(r"(?i)\b(tel|phone|ph|mobile)\b[:\s]*","",l).strip()
+            raw_phone = re.sub(r'[\[\]{}]','',raw_phone).strip()
             if raw_phone and not raw_phone.startswith('1') and len(raw_phone) < 11:
-                raw_phone = '1' + raw_phone if re.match(r'\d', raw_phone) else raw_phone
+                raw_phone = '1'+raw_phone if re.match(r'\d',raw_phone) else raw_phone
             phone = raw_phone
             break
     if not phone:
@@ -307,57 +263,42 @@ def rule_extract(clean_text: str) -> dict:
         if m:
             phone = m.group(1).strip()
 
-    # -- Date and Time
     date = _first(r"(?i)date[:\s]+([0-9]{1,2}[\/\-\.][0-9]{1,2}[\/\-\.][0-9]{2,4})", clean_text)
     if not date:
         date = _first(r"(\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b)", clean_text)
     time_val = _first(r"(\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[aApP][mM])?\b)", clean_text)
 
-    # -- Line items
     items = []
     for l in lines:
         stripped = l.strip()
-        if not stripped:
+        if not stripped or _FINANCIAL_LABELS.match(stripped) or _META_LABELS.match(stripped):
             continue
-        if _FINANCIAL_LABELS.match(stripped):
-            continue
-        if _META_LABELS.match(stripped):
-            continue
-
         prices = _PRICE_PAT.findall(stripped)
         if not prices:
             continue
-
         price = _normalise_price(prices[-1].strip())
         name  = _PRICE_PAT.sub('', stripped).strip()
-        name  = re.sub(r'^\d+\s*[xX*]?\s*', '', name).strip().rstrip(' :-,')
-
+        name  = re.sub(r'^\d+\s*[xX*]?\s*','',name).strip().rstrip(' :-,')
         if len(name) < 2:
             continue
+        items.append({"qty":"1","name":name,"price":price})
 
-        items.append({"qty": "1", "name": name, "price": price})
-
-    # -- Financials
     subtotal = _money(r"sub.?total", clean_text)
     tax      = _money(r"sales.?tax|(?<!\w)tax(?!\w)", clean_text)
     total    = _money(r"(?<!\w)total(?!\s*due)(?!.*sub)", clean_text)
     balance  = _money(r"balance", clean_text)
-
     thank_you = "THANK YOU" if "thank you" in lower else None
 
     fields = {}
-    for k, v in [("Vendor", vendor), ("Address", address),
-                 ("Tel", phone), ("Date", date), ("Time", time_val)]:
-        if v:
-            fields[k] = v.strip()
-    if thank_you:
-        fields["Note"] = thank_you
+    for k,v in [("Vendor",vendor),("Address",address),("Tel",phone),
+                ("Date",date),("Time",time_val)]:
+        if v: fields[k] = v.strip()
+    if thank_you: fields["Note"] = thank_you
 
     financials = {}
-    for k, v in [("Sub-total", subtotal), ("Sales Tax", tax),
-                 ("Total", total), ("Balance", balance)]:
-        if v:
-            financials[k] = v.strip()
+    for k,v in [("Sub-total",subtotal),("Sales Tax",tax),
+                ("Total",total),("Balance",balance)]:
+        if v: financials[k] = v.strip()
 
     result = {
         "doc_type":   doc_type,
@@ -446,10 +387,10 @@ def llm_understand(clean_text: str):
     try:
         raw  = response.choices[0].message.content.strip()
         data = json.loads(raw)
-        data.setdefault("source", "llm")
-        data.setdefault("items", [])
-        data.setdefault("fields", {})
-        data.setdefault("financials", {})
+        data.setdefault("source","llm")
+        data.setdefault("items",[])
+        data.setdefault("fields",{})
+        data.setdefault("financials",{})
         return data, None
     except (json.JSONDecodeError, IndexError, AttributeError):
         return None, "DeepSeek returned malformed JSON — using rule-based extraction."
@@ -461,11 +402,10 @@ def llm_understand(clean_text: str):
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    raw_text     = ""
-    clean_text   = ""
+    raw_text = clean_text = ""
     intelligence = None
-    ai_source    = "none"
-    ai_error     = None
+    ai_source = "none"
+    ai_error  = None
 
     if request.method == "POST":
         image = request.files.get("image")
@@ -485,11 +425,9 @@ def index():
                 intelligence=None, ai_source="none", ai_error=None,
                 error=f"Image error: {exc}")
 
-        raw_lines  = run_ocr(processed, confidence_threshold=0.25)
+        raw_lines  = run_ocr(processed)
         raw_text   = "\n".join(raw_lines)
         clean_text = pre_clean(raw_lines)
-
-        # Clean up uploaded file after processing — prevents disk fill on Render
         _cleanup(path)
 
         use_llm = request.form.get("refine") == "true"
@@ -511,7 +449,6 @@ def index():
 
 
 def _cleanup(path: str) -> None:
-    """Silently remove uploaded file after processing."""
     try:
         if os.path.exists(path):
             os.remove(path)
@@ -521,7 +458,7 @@ def _cleanup(path: str) -> None:
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "version": "3.3.0", "llm": "deepseek-chat"})
+    return jsonify({"status":"ok","version":"3.4.0","ocr":"tesseract","llm":"deepseek-chat"})
 
 
 if __name__ == "__main__":
