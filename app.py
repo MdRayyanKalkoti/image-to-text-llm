@@ -36,7 +36,12 @@ def get_reader():
     global reader
     if reader is None:
         log.info("Loading EasyOCR model...")
-        reader = easyocr.Reader(["en"], gpu=False)
+        reader = easyocr.Reader(
+            ["en"],
+            gpu=False,
+            verbose=False,
+            quantize=True          # cuts model memory by ~40%
+        )
         log.info("EasyOCR ready.")
     return reader
 
