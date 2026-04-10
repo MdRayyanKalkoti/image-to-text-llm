@@ -71,15 +71,11 @@ def enhance_image(path: str):
 # STAGE 2 - OCR (Tesseract — lightweight, no torch required)
 # ===============================================================
 
-# Tesseract config: OEM 3 (LSTM), PSM 6 (assume uniform block of text)
+# Tesseract config: OEM 3 = LSTM engine, PSM 6 = uniform block of text
 _TESS_CONFIG = r"--oem 3 --psm 6"
 
 
 def run_ocr(processed_img) -> list:
-    """
-    Run Tesseract OCR on the enhanced image.
-    Returns list of non-empty lines.
-    """
     from PIL import Image
     pil_img = Image.fromarray(processed_img)
     raw = pytesseract.image_to_string(pil_img, config=_TESS_CONFIG)
